@@ -45,6 +45,21 @@ time_periods = config["time_periods"]
 
 plex = PlexServer(PLEX_URL, PLEX_TOKEN, timeout=60)
 
+MIRROR_CONFIG = config.get("plex_mirror")
+MIRROR_ENABLED = bool(MIRROR_CONFIG and MIRROR_CONFIG.get("enabled"))
+mirror_plex = None
+mirror_lib = None
+if MIRROR_ENABLED:
+    try:
+        mirror_token = os.environ.get("MELODAY_MIRROR_PLEX_TOKEN") or MIRROR_CONFIG.get("token")
+        if not mirror_token:
+            raise RuntimeError("Mirror Plex token not set: define MELODAY_MIRROR_PLEX_TOKEN env var or plex_mirror.token in config.yml")
+        mirror_plex = PlexServer(MIRROR_CONFIG["url"], mirror_token, timeout=60)
+        mirror_lib = mirror_plex.library.section(MIRROR_CONFIG["music_library"])
+    except Exception as e:
+        print(f"Mirror server unreachable, disabling mirror: {e}")
+        MIRROR_ENABLED = False
+
 
 # ---------------------------------------------------------------------
 # HELPER: Print a simple progress bar (0-100%) with a message
@@ -487,6 +502,59 @@ def create_or_update_playlist(name, tracks, description, cover_file):
             existing_playlist.uploadPoster(filepath=new_cover)
     except Exception as e:
         print(f"Primary playlist update failed for '{name}': {e}")
+
+    if MIRROR_ENABLED:
+        mirror_playlist(name, valid_tracks, description, new_cover)
+
+
+def mirror_playlist(name, tracks, description, cover_path):
+    """Recreates the playlist on the mirror server, matching tracks by metadata
+    since ratingKeys aren't shared across servers."""
+    if not mirror_plex or not mirror_lib:
+        print(f"Mirror: unable to connect to mirror server for '{name}'")
+        return
+    try:
+        matched = []
+        for t in tracks:
+            try:
+                candidates = mirror_lib.searchTracks(title=t.title)
+            except Exception:
+                continue
+            match = next(
+                (c for c in candidates
+                 if c.title == t.title
+                 and getattr(c, "grandparentTitle", None) == getattr(t, "grandparentTitle", None)
+                 and getattr(c, "parentTitle", None) == getattr(t, "parentTitle", None)),
+                None
+            )
+            if match:
+                matched.append(match)
+
+        if not matched:
+            print(f"Mirror: no matching tracks found on mirror server for '{name}'")
+            return
+
+        existing_mirror_playlist = None
+        for playlist in mirror_plex.playlists():
+            if playlist and playlist.title.startswith("Meloday for "):
+                existing_mirror_playlist = playlist
+                break
+
+        if existing_mirror_playlist:
+            existing_mirror_playlist.removeItems(existing_mirror_playlist.items())
+            existing_mirror_playlist.addItems(matched)
+            existing_mirror_playlist.editTitle(name)
+            existing_mirror_playlist.editSummary(description)
+        else:
+            existing_mirror_playlist = mirror_plex.createPlaylist(name, items=matched)
+            existing_mirror_playlist.editSummary(description)
+
+        if cover_path and os.path.exists(cover_path):
+            existing_mirror_playlist.uploadPoster(filepath=cover_path)
+
+        print(f"Mirror: matched {len(matched)}/{len(tracks)} tracks for '{name}'")
+    except Exception as e:
+        print(f"Mirror failed for '{name}': {e}")
 
 def find_first_and_last_tracks(tracks, period):
     if not tracks:
