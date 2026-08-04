@@ -19,7 +19,9 @@ def load_config(filepath="config.yml"):
 config = load_config()
 
 PLEX_URL = config["plex"]["url"]
-PLEX_TOKEN = config["plex"]["token"]
+PLEX_TOKEN = os.environ.get("MELODAY_PLEX_TOKEN") or config["plex"].get("token")
+if not PLEX_TOKEN:
+    raise RuntimeError("Plex token not set: define MELODAY_PLEX_TOKEN env var or plex.token in config.yml")
 MUSIC_LIBRARY = config["plex"]["music_library"]
 
 EXCLUDE_PLAYED_DAYS = config["playlist"]["exclude_played_days"]
@@ -72,7 +74,7 @@ def get_current_time_period():
     # Fallback if not found
     return "Late Night"
 
-def load_descriptor_map(filepath="moodmap.json"):
+def load_descriptor_map(filepath):
     try:
         with open(filepath, "r", encoding="utf-8") as file:
             return json.load(file)
@@ -100,24 +102,29 @@ def wrap_text(text, font, draw, max_width):
 # ---------------------------------------------------------------------
 # Removed most debugging prints from these functions,
 # except for warnings or errors.
+_history_cache = {}
+
+def _cached_history(music_section, days_back):
+    """Caches Plex history per lookback window so main()'s retry loop doesn't re-query."""
+    if days_back not in _history_cache:
+        mindate = datetime.now() - timedelta(days=days_back)
+        _history_cache[days_back] = list(music_section.history(mindate=mindate))
+    return _history_cache[days_back]
+
 def fetch_historical_tracks(period):
     """
     Fetch tracks from Plex history that match the current daypart,
     while excluding recently played tracks.
     """
     music_section = plex.library.section(MUSIC_LIBRARY)
-    now = datetime.now()
     period_hours = set(time_periods[period]["hours"])
 
-    history_start = now - timedelta(days=HISTORY_LOOKBACK_DAYS)
-    exclude_start = now - timedelta(days=EXCLUDE_PLAYED_DAYS)
-
     history_entries = [
-        entry for entry in music_section.history(mindate=history_start)
+        entry for entry in _cached_history(music_section, HISTORY_LOOKBACK_DAYS)
         if entry.viewedAt and entry.viewedAt.hour in period_hours
     ]
     excluded_entries = [
-        entry for entry in music_section.history(mindate=exclude_start)
+        entry for entry in _cached_history(music_section, EXCLUDE_PLAYED_DAYS)
         if entry.viewedAt
     ]
 
@@ -130,7 +137,7 @@ def fetch_historical_tracks(period):
     # If no historical tracks found, fallback
     if not filtered_tracks:
         fallback_entries = [
-            entry for entry in music_section.history(mindate=history_start)
+            entry for entry in _cached_history(music_section, HISTORY_LOOKBACK_DAYS)
             if entry.viewedAt and entry.viewedAt.hour in period_hours
                and entry.ratingKey not in excluded_keys
         ]
@@ -142,8 +149,8 @@ def fetch_historical_tracks(period):
     genre_count = Counter()
     for track in filtered_tracks:
         track_play_counts[track] += 1
-        for genre in track.grandparentTitle or []:
-            genre_count[genre] += 1
+        for genre in track.genres or []:
+            genre_count[str(genre)] += 1
 
     sorted_tracks = sorted(filtered_tracks, key=lambda t: track_play_counts[t], reverse=True)
     split_index = max(1, len(sorted_tracks) // 4)
@@ -160,8 +167,8 @@ def fetch_historical_tracks(period):
         max_genre_limit = int(MAX_TRACKS * 0.25)
         if most_common_count > max_genre_limit:
             balanced_selection = (
-                [t for t in balanced_selection if most_common_genre not in t.genres][:max_genre_limit]
-                + [t for t in balanced_selection if most_common_genre in t.genres][:max_genre_limit]
+                [t for t in balanced_selection if most_common_genre not in [str(g) for g in (t.genres or [])]][:max_genre_limit]
+                + [t for t in balanced_selection if most_common_genre in [str(g) for g in (t.genres or [])]][:max_genre_limit]
             )
 
     return balanced_selection, excluded_keys
@@ -172,13 +179,16 @@ def filter_low_rated_tracks(tracks):
     skipping ephemeral tracks that lack ratingKey or parentRatingKey.
     """
     filtered = []
+    album_cache = {}
     for track in tracks:
         try:
             if not getattr(track, "ratingKey", None) or not getattr(track, "parentRatingKey", None):
                 continue
             artist = track.artist() if callable(getattr(track, "artist", None)) else None
             artist_rating = getattr(artist, "userRating", None) if artist else None
-            album = plex.fetchItem(track.parentRatingKey)
+            if track.parentRatingKey not in album_cache:
+                album_cache[track.parentRatingKey] = plex.fetchItem(track.parentRatingKey)
+            album = album_cache[track.parentRatingKey]
             album_rating = getattr(album, "userRating", None) if album else None
             track_rating = getattr(track, "userRating", None)
 
@@ -301,8 +311,8 @@ def fetch_sonically_similar_tracks(reference_tracks, excluded_keys=None):
 
                 filtered_similars.append(s)
 
-            # Run deduplication **before** adding similar tracks
-            final_similars = process_tracks(filter_low_rated_tracks(filtered_similars))
+            # process_tracks() also filters low-rated tracks internally
+            final_similars = process_tracks(filtered_similars)
             similar_tracks.extend(final_similars)
 
         except Exception as e:
@@ -314,16 +324,6 @@ def fetch_sonically_similar_tracks(reference_tracks, excluded_keys=None):
 
 
 
-def similarity_score(current, candidate, limit=20, max_distance=1.0):
-    try:
-        similars = current.sonicallySimilar(limit=limit, maxDistance=max_distance)
-    except Exception:
-        return 100
-    for index, track in enumerate(similars):
-        if track.ratingKey == candidate.ratingKey:
-            return index
-    return 100
-
 def sort_by_sonic_similarity_greedy(tracks, limit=20, max_distance=1.0):
     if len(tracks) < 2:
         return tracks
@@ -333,9 +333,14 @@ def sort_by_sonic_similarity_greedy(tracks, limit=20, max_distance=1.0):
     current = remaining.pop(start_index)
     sorted_list.append(current)
     while remaining:
+        try:
+            similars = current.sonicallySimilar(limit=limit, maxDistance=max_distance)
+            rank = {t.ratingKey: i for i, t in enumerate(similars)}
+        except Exception:
+            rank = {}
         next_track = min(
             remaining,
-            key=lambda candidate: similarity_score(current, candidate, limit, max_distance)
+            key=lambda candidate: rank.get(candidate.ratingKey, 100)
         )
         sorted_list.append(next_track)
         remaining.remove(next_track)
@@ -343,7 +348,7 @@ def sort_by_sonic_similarity_greedy(tracks, limit=20, max_distance=1.0):
     return sorted_list
 
 def generate_playlist_title_and_description(period, tracks):
-    descriptor_map = load_descriptor_map("moodmap.json")
+    descriptor_map = load_descriptor_map(MOOD_MAP_PATH)
     day_name = datetime.now().strftime("%A")
 
     top_genres = [str(g) for t in tracks for g in (t.genres or [])]
@@ -458,14 +463,15 @@ def apply_text_to_cover(image_path, text):
         return image_path
 
 def create_or_update_playlist(name, tracks, description, cover_file):
+    valid_tracks = [t for t in tracks if hasattr(t, "ratingKey")]
+    new_cover = None
     try:
         existing_playlist = None
         for playlist in plex.playlists():
-            if playlist.title.startswith("Meloday for "):
+            if playlist and playlist.title.startswith("Meloday for "):
                 existing_playlist = playlist
                 break
 
-        valid_tracks = [t for t in tracks if hasattr(t, "ratingKey")]
         if existing_playlist:
             existing_playlist.removeItems(existing_playlist.items())
             existing_playlist.addItems(valid_tracks)
@@ -479,8 +485,8 @@ def create_or_update_playlist(name, tracks, description, cover_file):
         if os.path.exists(cover_path):
             new_cover = apply_text_to_cover(cover_path, name)
             existing_playlist.uploadPoster(filepath=new_cover)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Primary playlist update failed for '{name}': {e}")
 
 def find_first_and_last_tracks(tracks, period):
     if not tracks:
