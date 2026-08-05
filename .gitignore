@@ -1,0 +1,10 @@
+venv
+assets/covers/flat/*_texted.webp
+config.yml
+.aiignore
+.cache
+.config
+.env
+.lesshst
+.ssh
+*.cfg

@@ -1,0 +1,7 @@
+*.py -text
+*.yml -text
+*.json -text
+*.md -text
+*.webp binary
+*.ttf binary
+*.otf binary
